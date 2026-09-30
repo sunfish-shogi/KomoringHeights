@@ -8,6 +8,11 @@
 
 #include <sstream>
 #include <queue>
+#include <set>
+
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#endif
 
 using namespace std;
 
@@ -318,6 +323,10 @@ void is_ready(bool skipCorruptCheck)
 
 	USI::read_engine_options(Path::Combine(Options["EvalDir"], "eval_options.txt"));
 
+#if !defined(__EMSCRIPTEN__)
+	// wasm 版ではこの処理は行わない。
+	// ・スレッドの生成に pthread の Worker を 1 つ余分に消費する。
+	// ・ShogiHome は isready の応答を待つ間に空行を必要としない。
 	// --- Keep Alive的な処理 ---
 
 	// "isready"を受け取ったあと、"readyok"を返すまで5秒ごとに改行を送るように修正する。(keep alive的な処理)
@@ -365,6 +374,7 @@ void is_ready(bool skipCorruptCheck)
 		Tools::sleep(100);
 
 	// --- Keep Alive的な処理ここまで ---
+#endif
 
 	// スレッドを先に生成しないとUSI_Hashで確保したメモリクリアの並列化が行われなくて困る。
 
@@ -664,9 +674,14 @@ void go_cmd(const Position& pos, istringstream& is , StateListPtr& states , bool
 			is >> token;
 			if (token == "infinite")
 				limits.mate = INT32_MAX;
-			else
+			else {
 				// USIプロトコルでは、UCIと異なり、ここは手数ではなく、探索に使う時間[ms]が指定されている。
-				limits.mate = stoi(token);
+				// stoi()は数値でないと例外を投げ、例外を無効にしたwasm版ではabort()してしまうので使わない。
+				// 数値として解釈できない場合は"infinite"と同じ扱いにする。
+				istringstream ss(token);
+				int mate_time;
+				limits.mate = (ss >> mate_time) ? mate_time : INT32_MAX;
+			}
 		}
 
 #if defined(TANUKI_MATE_ENGINE)
@@ -758,6 +773,241 @@ void search_cmd(Position& pos, istringstream& is)
 // 　　USI応答部
 // --------------------
 
+// USIコマンドを1つ実行する。
+// "quit"が来たらtrueを返す。
+// cmds : 先行入力されているコマンド。"f"コマンドでファイルから読み込んだコマンドがここに積まれる。
+static bool usi_cmdexec(Position& pos, StateListPtr& states, queue<string>& cmds, const string& cmd)
+{
+	istringstream is(cmd);
+
+	string token;
+	is >> skipws >> token;
+
+	if (token == "quit" || token == "stop" || token == "gameover")
+	{
+		// USIプロトコルにはUCIプロトコルから、
+		// gameover win | lose | draw
+		// が追加されているが、stopと同じ扱いをして良いと思う。
+		// これハンドルしておかないとponderが停止しなくて困る。
+		// gameoverに対してbestmoveは返すべきではないのかも知れないが、
+		// それを言えばstopにだって…。
+
+#if defined(USE_GAMEOVER_HANDLER)
+		// "gameover"コマンドに対するハンドラを呼び出したいのか？
+		if (token == "gameover")
+			gameover_handler(cmd);
+#endif
+
+		// "go infinite" , "go ponder"などで思考を終えて寝てるかも知れないが、
+		// そいつらはThreads.stopを待っているので問題ない。
+		Threads.stop = true;
+
+	} else if (token == "ponderhit")
+	{
+		if (Options["Stochastic_Ponder"])
+		{
+			// Stochastic Ponder hit
+
+			// まず探索スレッドを停止させる。
+			// ただしこの時にbestmoveを返してはならないので、これはSearch::Limits.silentで抑制する。
+			auto org = Search::Limits.silent;
+			Search::Limits.silent = true;
+			Threads.stop = true;
+			// 終了を待機しないとsilentの解除ができない。
+			Threads.main()->wait_for_search_finished();
+			Search::Limits.silent = org;
+
+			// 前回と同様のgoコマンドをそのまま送る。ただし"ponder"の文字は無視する。
+			// last_go_cmd_stringには先頭に"go"の文字があるが、それはgo_cmdのなかで無視されるので気にしなくて良い。
+			istringstream iss(Threads.main()->last_go_cmd_string);
+			go_cmd(pos, iss, states, true);
+		}
+		else {
+			// 通常のponder
+			Time.reset_for_ponderhit(); // ponderhitから計測しなおすべきである。
+			Threads.main()->ponder = false; // 通常探索に切り替える。
+		}
+	}
+
+	// 起動時いきなりこれが飛んでくるので速攻応答しないとタイムアウトになる。
+	else if (token == "usi")
+		sync_cout << engine_info() << Options << "usiok" << sync_endl;
+
+	// オプションを設定する
+	else if (token == "setoption") setoption_cmd(is);
+
+	// 与えられた局面について思考するコマンド
+	else if (token == "go") {
+		Threads.main()->last_go_cmd_string = cmd;       // 保存しておく。
+		go_cmd(pos, is, states);
+	}
+
+	// (思考などに使うための)開始局面(root)を設定する
+	else if (token == "position") {
+		Threads.main()->last_position_cmd_string = cmd; // 保存しておく。
+		position_cmd(pos, is, states);
+	}
+
+	// "usinewgame"はゲーム中にsetoptionなどを送らないことを宣言するためのものだが、
+	// 我々はこれに関知しないので単に無視すれば良い。
+	// やねうら王では、時間のかかる初期化はisreadyの応答でやっている。
+	// Stockfishでは、Search::clear() (時間のかかる処理)をここで呼び出しているようだが。
+	// そもそもで言うと、"usinewgame"に対してはエンジン側は何ら応答を返さないので、
+	// GUI側は、エンジン側が処理中なのかどうかが判断できない。
+	// なのでここで長い時間のかかる処理はすべきではないと思うのだが。
+	else if (token == "usinewgame") {}
+
+	// 思考エンジンの準備が出来たかの確認
+	else if (token == "isready") is_ready_cmd(pos,states);
+
+	// 以下、デバッグのためのカスタムコマンド(非USIコマンド)
+	// 探索中には使わないようにすべし。
+
+#if defined(USER_ENGINE)
+	// ユーザーによる実験用コマンド。user.cppのuser()が呼び出される。
+	else if (token == "user") user_test(pos, is);
+#endif
+
+	// ベンチコマンド(これは常に使える)
+	else if (token == "bench") bench_cmd(pos, is);
+
+	// 現在の局面を表示する。(デバッグ用)
+	else if (token == "d") cout << pos << endl;
+
+	// USI Commands from File
+	else if (token == "f") {
+		string filename = "";
+		is >> filename;
+		if (!filename.empty())
+		{
+			filename += ".txt";
+			sync_cout << "USI Commands from File = " << filename << sync_endl;
+			vector<string> lines;
+			SystemIO::ReadAllLines(filename, lines);
+			for (auto& line : lines)
+				cmds.push(line);
+		}
+	}
+
+	// 現在の局面について評価関数を呼び出して、その値を返す。
+	else if (token == "eval") cout << "eval = " << Eval::compute_eval(pos) << endl;
+	else if (token == "evalstat") Eval::print_eval_stat(pos);
+
+	// この実行ファイルをコンパイルしたコンパイラの情報を出力する。
+	else if (token == "compiler") sync_cout << compiler_info() << sync_endl;
+
+	// -- 以下、やねうら王独自拡張のカスタムコマンド
+
+	// オプションを取得する(USI独自拡張)
+	else if (token == "getoption") getoption_cmd(is);
+
+	// 指し手生成祭りの局面をセットする。
+	else if (token == "matsuri") pos.set("l6nl/5+P1gk/2np1S3/p1p4Pp/3P2Sp1/1PPb2P1P/P5GS1/R8/LN4bKL w GR5pnsg 1", &states->back(), Threads.main());
+
+	// "position sfen"の略。
+	else if (token == "sfen") position_cmd(pos, is, states);
+
+	// ログファイルの書き出しのon
+	// 備考)
+	// Stockfishの方は、エンジンオプションでログの出力ファイル名を指定できるのだが、
+	// ログ自体はホスト側で記録することが多いので、ファイル名は固定でいいや…。
+	else if (token == "log") start_logger("io_log.txt");
+
+#if defined(EVAL_LEARN)
+	// テスト用にqsearch(),search()を直接呼ぶコマンド
+	else if (token == "qsearch") qsearch_cmd(pos);
+	else if (token == "search") search_cmd(pos,is);
+#endif
+
+	// この局面での指し手をすべて出力
+	else if (token == "moves") {
+		for (auto m : MoveList<LEGAL_ALL>(pos))
+			cout << m.move << ' ';
+		cout << endl;
+	}
+
+	// この局面の手番側がどちらであるかを返す。BLACK or WHITE
+	else if (token == "side") cout << (pos.side_to_move() == BLACK ? "black":"white") << endl;
+
+	// この局面が詰んでいるかの判定
+	else if (token == "mated") cout << pos.is_mated() << endl;
+
+	// この局面のhash keyの値を出力
+	else if (token == "key") cout << hex << pos.state()->key() << dec << endl;
+
+	// 探索の終了を待機するコマンド("stop"は送らずに。goコマンドの終了を待機できて便利。)
+	else if (token == "wait") Threads.main()->wait_for_search_finished();
+
+	// 一定時間待機するコマンド。("quit"の前に一定時間待ちたい時などに用いる。sleep 1000 == 1秒待つ)
+	else if (token == "sleep") { u64 ms; is >> ms; Tools::sleep(ms); }
+
+#if defined(MATE_1PLY) && defined(LONG_EFFECT_LIBRARY)
+	// この局面での1手詰め判定
+	else if (token == "mate1") cout << pos.mate1ply() << endl;
+#endif
+
+#if defined (ENABLE_TEST_CMD)
+	// テストコマンド
+	else if (token == "test") Test::test_cmd(pos, is);
+#endif
+
+	// UnitTest
+	else if (token == "unittest") Test::UnitTest(pos, is);
+
+#if defined (ENABLE_MAKEBOOK_CMD) && (defined(EVAL_LEARN) || defined(YANEURAOU_ENGINE_DEEP))
+	// 定跡を作るコマンド
+	else if (token == "makebook") Book::makebook_cmd(pos, is);
+#endif
+
+#if defined (EVAL_LEARN)
+	else if (token == "gensfen") Learner::gen_sfen(pos, is);
+	else if (token == "learn") Learner::learn(pos, is);
+
+#if defined (GENSFEN2019)
+	// 開発中の教師局面生成コマンド
+	else if (token == "gensfen2019") Learner::gen_sfen2019(pos, is);
+#endif
+
+#endif
+
+#if defined(YANEURAOU_ENGINE_DEEP)
+	else if (token == "cluster")
+		// cluster時のUSIメッセージの処理ループ
+		YaneuraouTheCluster::cluster_usi_loop(pos, is);
+#endif
+
+	else
+	{
+		//    簡略表現として、
+		//> threads 1
+		//      のように指定したとき、
+		//> setoption name Threads value 1
+		//      と等価なようにしておく。
+
+		if (!token.empty())
+		{
+			string value;
+			is >> value;
+
+			for (auto& o : Options)
+			{
+				// 大文字、小文字を無視して比較。
+				if (!StringExtension::stricmp(token, o.first))
+				{
+					Options[o.first] = value;
+					sync_cout << "Options[" << o.first << "] = " << value << sync_endl;
+
+					goto OPTION_FOUND;
+				}
+			}
+			sync_cout << "No such option: " << token << sync_endl;
+		OPTION_FOUND:;
+		}
+	}
+
+	return token == "quit";
+}
+
 // USI応答部本体
 void USI::loop(int argc, char* argv[])
 {
@@ -765,7 +1015,7 @@ void USI::loop(int argc, char* argv[])
 	// "position"コマンドで設定された局面が格納されている。
 	Position pos;
 
-	string cmd, token;
+	string cmd;
 
 	// 局面を遡るためのStateInfoのlist。
 	StateListPtr states(new StateList(1));
@@ -826,238 +1076,73 @@ void USI::loop(int argc, char* argv[])
 			cmds.pop();
 		}
 
-		istringstream is(cmd);
+		if (usi_cmdexec(pos, states, cmds, cmd))
+			break;
 
-		token.clear(); // getlineが空を返したときのためのクリア
-		is >> skipws >> token;
-
-		if (token == "quit" || token == "stop" || token == "gameover")
-		{
-			// USIプロトコルにはUCIプロトコルから、
-			// gameover win | lose | draw
-			// が追加されているが、stopと同じ扱いをして良いと思う。
-			// これハンドルしておかないとponderが停止しなくて困る。
-			// gameoverに対してbestmoveは返すべきではないのかも知れないが、
-			// それを言えばstopにだって…。
-
-#if defined(USE_GAMEOVER_HANDLER)
-			// "gameover"コマンドに対するハンドラを呼び出したいのか？
-			if (token == "gameover")
-				gameover_handler(cmd);
-#endif
-
-			// "go infinite" , "go ponder"などで思考を終えて寝てるかも知れないが、
-			// そいつらはThreads.stopを待っているので問題ない。
-			Threads.stop = true;
-
-		} else if (token == "ponderhit")
-		{
-			if (Options["Stochastic_Ponder"])
-			{
-				// Stochastic Ponder hit
-
-				// まず探索スレッドを停止させる。
-				// ただしこの時にbestmoveを返してはならないので、これはSearch::Limits.silentで抑制する。
-				auto org = Search::Limits.silent;
-				Search::Limits.silent = true;
-				Threads.stop = true;
-				// 終了を待機しないとsilentの解除ができない。
-				Threads.main()->wait_for_search_finished();
-				Search::Limits.silent = org;
-
-				// 前回と同様のgoコマンドをそのまま送る。ただし"ponder"の文字は無視する。
-				// last_go_cmd_stringには先頭に"go"の文字があるが、それはgo_cmdのなかで無視されるので気にしなくて良い。
-				istringstream iss(Threads.main()->last_go_cmd_string);
-				go_cmd(pos, iss, states, true);
-			}
-			else {
-				// 通常のponder
-				Time.reset_for_ponderhit(); // ponderhitから計測しなおすべきである。
-				Threads.main()->ponder = false; // 通常探索に切り替える。
-			}
-		}
-
-		// 起動時いきなりこれが飛んでくるので速攻応答しないとタイムアウトになる。
-		else if (token == "usi")
-			sync_cout << engine_info() << Options << "usiok" << sync_endl;
-
-		// オプションを設定する
-		else if (token == "setoption") setoption_cmd(is);
-
-		// 与えられた局面について思考するコマンド
-		else if (token == "go") {
-			Threads.main()->last_go_cmd_string = cmd;       // 保存しておく。
-			go_cmd(pos, is, states);
-		}
-
-		// (思考などに使うための)開始局面(root)を設定する
-		else if (token == "position") {
-			Threads.main()->last_position_cmd_string = cmd; // 保存しておく。
-			position_cmd(pos, is, states);
-		}
-
-		// "usinewgame"はゲーム中にsetoptionなどを送らないことを宣言するためのものだが、
-		// 我々はこれに関知しないので単に無視すれば良い。
-		// やねうら王では、時間のかかる初期化はisreadyの応答でやっている。
-		// Stockfishでは、Search::clear() (時間のかかる処理)をここで呼び出しているようだが。
-		// そもそもで言うと、"usinewgame"に対してはエンジン側は何ら応答を返さないので、
-		// GUI側は、エンジン側が処理中なのかどうかが判断できない。
-		// なのでここで長い時間のかかる処理はすべきではないと思うのだが。
-		else if (token == "usinewgame") continue;
-
-		// 思考エンジンの準備が出来たかの確認
-		else if (token == "isready") is_ready_cmd(pos,states);
-
-		// 以下、デバッグのためのカスタムコマンド(非USIコマンド)
-		// 探索中には使わないようにすべし。
-
-#if defined(USER_ENGINE)
-		// ユーザーによる実験用コマンド。user.cppのuser()が呼び出される。
-		else if (token == "user") user_test(pos, is);
-#endif
-
-		// ベンチコマンド(これは常に使える)
-		else if (token == "bench") bench_cmd(pos, is);
-
-		// 現在の局面を表示する。(デバッグ用)
-		else if (token == "d") cout << pos << endl;
-
-		// USI Commands from File
-		else if (token == "f") {
-			string filename = "";
-			is >> filename;
-			if (!filename.empty())
-			{
-				filename += ".txt";
-				sync_cout << "USI Commands from File = " << filename << sync_endl;
-				vector<string> lines;
-				SystemIO::ReadAllLines(filename, lines);
-				for (auto& line : lines)
-					cmds.push(line);
-			}
-		}
-
-		// 現在の局面について評価関数を呼び出して、その値を返す。
-		else if (token == "eval") cout << "eval = " << Eval::compute_eval(pos) << endl;
-		else if (token == "evalstat") Eval::print_eval_stat(pos);
-
-		// この実行ファイルをコンパイルしたコンパイラの情報を出力する。
-		else if (token == "compiler") sync_cout << compiler_info() << sync_endl;
-
-		// -- 以下、やねうら王独自拡張のカスタムコマンド
-
-		// オプションを取得する(USI独自拡張)
-		else if (token == "getoption") getoption_cmd(is);
-
-		// 指し手生成祭りの局面をセットする。
-		else if (token == "matsuri") pos.set("l6nl/5+P1gk/2np1S3/p1p4Pp/3P2Sp1/1PPb2P1P/P5GS1/R8/LN4bKL w GR5pnsg 1", &states->back(), Threads.main());
-
-		// "position sfen"の略。
-		else if (token == "sfen") position_cmd(pos, is, states);
-
-		// ログファイルの書き出しのon
-		// 備考)
-		// Stockfishの方は、エンジンオプションでログの出力ファイル名を指定できるのだが、
-		// ログ自体はホスト側で記録することが多いので、ファイル名は固定でいいや…。
-		else if (token == "log") start_logger("io_log.txt");
-
-#if defined(EVAL_LEARN)
-		// テスト用にqsearch(),search()を直接呼ぶコマンド
-		else if (token == "qsearch") qsearch_cmd(pos);
-		else if (token == "search") search_cmd(pos,is);
-#endif
-
-		// この局面での指し手をすべて出力
-		else if (token == "moves") {
-			for (auto m : MoveList<LEGAL_ALL>(pos))
-				cout << m.move << ' ';
-			cout << endl;
-		}
-
-		// この局面の手番側がどちらであるかを返す。BLACK or WHITE
-		else if (token == "side") cout << (pos.side_to_move() == BLACK ? "black":"white") << endl;
-
-		// この局面が詰んでいるかの判定
-		else if (token == "mated") cout << pos.is_mated() << endl;
-
-		// この局面のhash keyの値を出力
-		else if (token == "key") cout << hex << pos.state()->key() << dec << endl;
-
-		// 探索の終了を待機するコマンド("stop"は送らずに。goコマンドの終了を待機できて便利。)
-		else if (token == "wait") Threads.main()->wait_for_search_finished();
-
-		// 一定時間待機するコマンド。("quit"の前に一定時間待ちたい時などに用いる。sleep 1000 == 1秒待つ)
-		else if (token == "sleep") { u64 ms; is >> ms; Tools::sleep(ms); }
-
-#if defined(MATE_1PLY) && defined(LONG_EFFECT_LIBRARY)
-		// この局面での1手詰め判定
-		else if (token == "mate1") cout << pos.mate1ply() << endl;
-#endif
-
-#if defined (ENABLE_TEST_CMD)
-		// テストコマンド
-		else if (token == "test") Test::test_cmd(pos, is);
-#endif
-
-		// UnitTest
-		else if (token == "unittest") Test::UnitTest(pos, is);
-
-#if defined (ENABLE_MAKEBOOK_CMD) && (defined(EVAL_LEARN) || defined(YANEURAOU_ENGINE_DEEP))
-		// 定跡を作るコマンド
-		else if (token == "makebook") Book::makebook_cmd(pos, is);
-#endif
-
-#if defined (EVAL_LEARN)
-		else if (token == "gensfen") Learner::gen_sfen(pos, is);
-		else if (token == "learn") Learner::learn(pos, is);
-
-#if defined (GENSFEN2019)
-		// 開発中の教師局面生成コマンド
-		else if (token == "gensfen2019") Learner::gen_sfen2019(pos, is);
-#endif
-
-#endif
-
-#if defined(YANEURAOU_ENGINE_DEEP)
-		else if (token == "cluster")
-			// cluster時のUSIメッセージの処理ループ
-			YaneuraouTheCluster::cluster_usi_loop(pos, is);
-#endif
-
-		else
-		{
-			//    簡略表現として、
-			//> threads 1
-			//      のように指定したとき、
-			//> setoption name Threads value 1
-			//      と等価なようにしておく。
-
-			if (!token.empty())
-			{
-				string value;
-				is >> value;
-
-				for (auto& o : Options)
-				{
-					// 大文字、小文字を無視して比較。
-					if (!StringExtension::stricmp(token, o.first))
-					{
-						Options[o.first] = value;
-						sync_cout << "Options[" << o.first << "] = " << value << sync_endl;
-
-						goto OPTION_FOUND;
-					}
-				}
-				sync_cout << "No such option: " << token << sync_endl;
-			OPTION_FOUND:;
-			}
-		}
-
-	} while (token != "quit");
+	} while (true);
 
 	// quitが来た時点ではまだ探索中かも知れないのでmain threadの停止を待つ。
 	Threads.main()->wait_for_search_finished();
 }
+
+#if defined(__EMSCRIPTEN__)
+
+// --------------------
+// WebAssembly 版の USI 応答部
+// --------------------
+
+// ShogiHome WASM ABI (shogihome-wasm-engine/1) 向けのエントリーポイント。
+// wasm_pre.js から Module.ccall("usi_command", ...) で 1 行ずつ呼び出される。
+//
+// wasm 版では探索スレッドの出力 (bestmove など) が Emscripten によって
+// メインスレッドへ同期的に代理実行される。そのため、探索中にメインスレッドで
+// 探索の終了を待つようなコマンド ("go", "isready" など) を実行すると
+// 互いに待つ形になって止まってしまう。
+// 探索中に届いたそのようなコマンドは実行せずに 1 を返し、JS 側で後から再送してもらう。
+// 探索中でも待たずに処理できるコマンドは、ネイティブ版と同じく即座に実行する。
+//
+// 戻り値
+//   0 : 実行した。
+//   1 : まだ実行できない。あとで再送すること。
+extern "C" EMSCRIPTEN_KEEPALIVE int usi_command(const char* c_cmd)
+{
+	// 探索開始局面(root)を格納するPositionクラス
+	static Position pos;
+
+	// 局面を遡るためのStateInfoのlist。
+	static StateListPtr states(new StateList(1));
+
+	// "f"コマンドで読み込まれたコマンド
+	static queue<string> cmds;
+
+	const string cmd = c_cmd != nullptr ? c_cmd : "";
+
+	string token;
+	istringstream(cmd) >> skipws >> token;
+
+	// 探索中でも探索の終了を待たずに処理できるコマンド
+	static const std::set<string> non_blocking_commands = {
+		"stop", "ponderhit", "gameover", "usi", "setoption", "position", "usinewgame",
+	};
+
+	// それ以外のコマンドは、探索の終了後に再送してもらう。
+	if (Threads.main()->is_searching() && non_blocking_commands.count(token) == 0)
+		return 1;
+
+	usi_cmdexec(pos, states, cmds, cmd);
+
+	// "f"コマンドで読み込まれたコマンドを実行する。
+	while (!cmds.empty() && !Threads.main()->is_searching())
+	{
+		const string c = cmds.front();
+		cmds.pop();
+		usi_cmdexec(pos, states, cmds, c);
+	}
+
+	return 0;
+}
+
+#endif
 
 // --------------------
 // USI関係の記法変換部

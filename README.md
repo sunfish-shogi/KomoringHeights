@@ -43,6 +43,22 @@ make normal TARGET_CPU=AVX2 COMPILER=clang++
 GCC 11、Clang 14 より新しいコンパイラのみ動作確認をしています。
 これらより古い環境ではサポート対象外となるのでご注意ください。
 
+### WebAssembly 版
+
+[ShogiHome WASM ABI](https://github.com/sunfish-shogi/shogihome/blob/main/specs/wasm-engine-abi.md) (`shogihome-wasm-engine/1`) に準拠した
+WebAssembly 版を Docker 上の Emscripten (`emscripten/emsdk:6.0.6`) でビルドできます。
+
+```sh
+./script/wasm_build.sh
+```
+
+成果物 (`engine.json`、`komoring-heights.js`、`komoring-heights.wasm`、`LICENSE.txt`) は `build/wasm/komoring-heights/` に生成されます。
+このディレクトリを ShogiHome の `public/engines/` 以下に配置すると組み込みエンジンとして使用できます。
+`engine.json` の `name`・`author`・`options` はビルドしたエンジンの `usi` コマンドへの応答から自動で生成されます。
+
+WebAssembly 版は探索スレッドに pthread を使用するため、cross-origin isolation (`SharedArrayBuffer`) が必要です。
+また、ブラウザ上で動かすため `Threads` の上限を 4、`USI_Hash` の既定値を 64 MB、上限を 256 MB にしています。
+
 ## References
 
 詰将棋エンジンを作る上で参考にした文献等については[References](source/engine/user-engine/docs/refs.md)を参照してください。
