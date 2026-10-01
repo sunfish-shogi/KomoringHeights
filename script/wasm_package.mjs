@@ -5,9 +5,10 @@
 //
 // 使い方: node script/wasm_package.mjs <glue.js> <output dir>
 //
-// マニフェスト (engine.json) の name / author / options は、ビルドしたエンジンを
-// 実際に起動して "usi" コマンドの応答から作る。エンジンのオプションを変更しても
-// マニフェストを手で直す必要はない。
+// マニフェスト (engine.json) の name / author / options は、成果物のディレクトリに
+// コピーしたエンジンを実際に起動して "usi" コマンドの応答から作る。エンジンのオプションを
+// 変更してもマニフェストを手で直す必要はない。また、成果物にファイルが欠けていれば
+// ここで起動に失敗するので気付ける。
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -22,13 +23,13 @@ if (!gluePath || !outputDir) {
 }
 
 const moduleName = path.basename(gluePath);
-const wasmName = moduleName.replace(/\.js$/, ".wasm");
-const wasmPath = path.join(path.dirname(gluePath), wasmName);
+const baseName = moduleName.replace(/\.js$/, "");
+const buildDir = path.dirname(gluePath);
 
 // --- エンジンを起動して usi の応答を得る
 
-async function queryEngine() {
-  const { default: createEngine } = await import(pathToFileURL(path.resolve(gluePath)).href);
+async function queryEngine(modulePath) {
+  const { default: createEngine } = await import(pathToFileURL(path.resolve(modulePath)).href);
   const engine = await createEngine({
     printErr: (line) => console.error(line),
   });
@@ -96,31 +97,83 @@ function parseOption(line) {
   return option;
 }
 
-// ソースコードの入手先。コピーレフトのライセンスでは必須。
-// ビルドしたコミットを指せるならそれを指す。
-function sourceURL() {
-  const base = process.env.KH_SOURCE_URL || "https://github.com/sunfish-shogi/KomoringHeights";
+// git コマンドを実行する。失敗した場合は undefined を返す。
+function git(...args) {
   try {
-    const commit = execFileSync("git", ["-c", "safe.directory=*", "rev-parse", "HEAD"], {
+    return execFileSync("git", ["-c", "safe.directory=*", ...args], {
       cwd: repoRoot,
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
-    if (/^[0-9a-f]{40}$/.test(commit)) {
-      return `${base}/tree/${commit}`;
-    }
   } catch {
-    // git が無い環境では base をそのまま使う。
+    return undefined;
+  }
+}
+
+// リモートリポジトリの URL を https の URL に変換する。
+//   git@github.com:owner/repo.git -> https://github.com/owner/repo
+//   https://github.com/owner/repo.git -> https://github.com/owner/repo
+function toHttpsURL(remote) {
+  const ssh = /^git@([^:]+):(.+?)(\.git)?$/.exec(remote);
+  if (ssh) {
+    return `https://${ssh[1]}/${ssh[2]}`;
+  }
+  try {
+    const url = new URL(remote);
+    if (url.protocol !== "https:" && url.protocol !== "http:") {
+      return undefined;
+    }
+    return `https://${url.host}${url.pathname.replace(/\.git$/, "").replace(/\/$/, "")}`;
+  } catch {
+    return undefined;
+  }
+}
+
+// ソースコードの入手先。コピーレフトのライセンスでは必須。
+// KH_SOURCE_URL が無ければ、ビルドしたリポジトリの origin を使う。
+// ビルドしたコミットを指せるならそれを指す。
+function sourceURL() {
+  const remote = git("remote", "get-url", "origin");
+  const base =
+    process.env.KH_SOURCE_URL ||
+    (remote && toHttpsURL(remote)) ||
+    "https://github.com/komori-n/KomoringHeights";
+  const commit = git("rev-parse", "HEAD");
+  if (commit && /^[0-9a-f]{40}$/.test(commit)) {
+    return `${base}/tree/${commit}`;
   }
   return base;
 }
 
 function badge() {
-  const size = fs.statSync(wasmPath).size + fs.statSync(gluePath).size;
+  const size = fs
+    .readdirSync(outputDir)
+    .filter((file) => file.startsWith(baseName + "."))
+    .reduce((sum, file) => sum + fs.statSync(path.join(outputDir, file)).size, 0);
   return `${Math.max(1, Math.round(size / (1024 * 1024)))}MB`;
 }
 
-const lines = await queryEngine();
+// --- 成果物をコピーする
+
+fs.rmSync(outputDir, { recursive: true, force: true });
+fs.mkdirSync(outputDir, { recursive: true });
+// グルーコード・wasm に加えて、Emscripten 3.1.58 より前の版でビルドした場合に出力される
+// pthread 用のスクリプト (<module>.worker.js) などもコピーする。
+for (const file of fs.readdirSync(buildDir)) {
+  if (file.startsWith(baseName + ".") && /\.(js|mjs|wasm)$/.test(file)) {
+    fs.copyFileSync(path.join(buildDir, file), path.join(outputDir, file));
+    fs.chmodSync(path.join(outputDir, file), 0o644);
+  }
+}
+if (!fs.existsSync(path.join(outputDir, baseName + ".wasm"))) {
+  console.error(`${baseName}.wasm が見つからない`);
+  process.exit(1);
+}
+fs.copyFileSync(path.join(repoRoot, "Copying.txt"), path.join(outputDir, "LICENSE.txt"));
+
+// --- マニフェストを作る
+
+const lines = await queryEngine(path.join(outputDir, moduleName));
 const idName = lines.find((line) => line.startsWith("id name "))?.substring("id name ".length);
 const idAuthor = lines.find((line) => line.startsWith("id author "))?.substring("id author ".length);
 if (!idName || !idAuthor) {
@@ -157,12 +210,6 @@ const manifest = {
   ],
 };
 
-fs.rmSync(outputDir, { recursive: true, force: true });
-fs.mkdirSync(outputDir, { recursive: true });
-fs.copyFileSync(gluePath, path.join(outputDir, moduleName));
-fs.copyFileSync(wasmPath, path.join(outputDir, wasmName));
-fs.chmodSync(path.join(outputDir, wasmName), 0o644);
-fs.copyFileSync(path.join(repoRoot, "Copying.txt"), path.join(outputDir, "LICENSE.txt"));
 fs.writeFileSync(path.join(outputDir, "engine.json"), JSON.stringify(manifest, null, 2) + "\n");
 
 console.log(`WebAssembly engine package: ${outputDir}`);
