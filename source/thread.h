@@ -27,7 +27,8 @@
 class Thread
 {
 	// exitフラグやsearchingフラグの状態を変更するときのmutex
-	std::mutex mutex;
+	// (is_searching() const からも読み取り時にロックするので mutable にしてある)
+	mutable std::mutex mutex;
 
 	// idle_loop()で待機しているときに待つ対象
 	std::condition_variable cv;
@@ -77,7 +78,8 @@ public:
 	// === やねうら王独自拡張 ===
 
 	// 探索中であるかを返す。
-	bool is_searching() const { return searching; }
+	// searchingはidle_loop()などでmutexを取って書き換えられるので、読み取りも同じmutexで保護する。
+	bool is_searching() const { std::lock_guard<std::mutex> lk(mutex); return searching; }
 
 	// ------------------------------
 	//       探索に必要なもの

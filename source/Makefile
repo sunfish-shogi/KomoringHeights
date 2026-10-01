@@ -63,6 +63,8 @@ TARGET_CPU = AVX2
 # -- ARMとか
 #TARGET_CPU = OTHER
 #TARGET_CPU = GRAVITON2
+# -- WebAssembly (COMPILER = em++ と組み合わせて使う)
+#TARGET_CPU = WASM
 
 
 # デバッガーを使用するか (debugger)
@@ -74,6 +76,9 @@ DEBUG = OFF
 # ※ clangでコンパイルしたほうがgccより数%速いっぽい。
 #COMPILER = g++
 COMPILER = clang++
+# WebAssembly 版 (ShogiHome WASM ABI 準拠) をビルドするときは em++ を指定する。
+# 通常は script/wasm_build.sh から Docker 上でビルドする。
+#COMPILER = em++
 
 
 # エンジンの表示名 (engine displayname)
@@ -153,6 +158,37 @@ ifneq (,$(findstring clang++,$(COMPILER)))
 	# → 本当に消してしまっても大丈夫か？
 	WCPPFLAGS += -fno-threadsafe-statics
 
+else ifneq (,$(findstring em++,$(COMPILER)))
+	# 関数の引数が関数本体で使われていないときに警告出るのうざすぎるので抑制。
+	CPPFLAGS += -Wno-unused-parameter
+
+	# ShogiHome WASM ABI (shogihome-wasm-engine/1) に従ってビルドする。
+	# cf. https://github.com/sunfish-shogi/shogihome/blob/main/specs/wasm-engine-abi.md
+
+	# グルーコードのエクスポート名
+	EM_EXPORT_NAME = createKomoringHeights
+	# 起動時に確保するメモリ量。置換表(USI_Hash)は必要に応じてメモリを伸長して確保する。
+	EM_INITIAL_MEMORY = 67108864
+	# スレッド用に起動時に生成しておくWorkerの数。
+	# エンジンオプション"Threads"の上限(usi_option.cpp)と合わせること。
+	EM_PTHREAD_POOL_SIZE = 4
+	# 探索スレッドのスタックサイズ。thread_win32_osx.hのTH_STACK_SIZEと同じ8MBにしておく。
+	EM_STACK_SIZE = 8388608
+
+	# 探索スレッドを使うので、SharedArrayBuffer (cross-origin isolation) が必要になる。
+	CPPFLAGS += -pthread
+	EM_LDFLAGS += -pthread
+	EM_LDFLAGS += --pre-js wasm/wasm_pre.js
+	EM_LDFLAGS += -sMODULARIZE=1 -sEXPORT_ES6=1 -sEXPORT_NAME=$(EM_EXPORT_NAME)
+	EM_LDFLAGS += -sENVIRONMENT=worker,node
+	EM_LDFLAGS += -sINVOKE_RUN=0 --no-entry
+	EM_LDFLAGS += -sEXPORTED_FUNCTIONS=_usi_init,_usi_command,_malloc,_free
+	EM_LDFLAGS += -sEXPORTED_RUNTIME_METHODS=ccall,cwrap
+	EM_LDFLAGS += -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=$(EM_INITIAL_MEMORY) -sMAXIMUM_MEMORY=2147483648
+	EM_LDFLAGS += -sPTHREAD_POOL_SIZE=$(EM_PTHREAD_POOL_SIZE)
+	EM_LDFLAGS += -sSTACK_SIZE=$(EM_STACK_SIZE) -sDEFAULT_PTHREAD_STACK_SIZE=$(EM_STACK_SIZE)
+	LDFLAGS += $(EM_LDFLAGS)
+
 else
 	ifneq (,$(findstring g++,$(COMPILER)))
 		# mingw g++ で AVX512 向けビルドを行おうとするとエラーになる問題の回避
@@ -167,7 +203,9 @@ else
 endif
 
 TARGETDIR = .
-ifeq ($(OS),Windows_NT)
+ifneq (,$(findstring em++,$(COMPILER)))
+	TARGET = $(TARGETDIR)/komoring-heights.js
+else ifeq ($(OS),Windows_NT)
 	CPPFLAGS += $(WCPPFLAGS)
 	LDFLAGS += -static -Wl,--stack,25000000
 	TARGET = $(TARGETDIR)/KomoringHeights-by-gcc.exe
@@ -198,8 +236,11 @@ endif
 CPPFLAGS  += -DUNICODE
 
 # stripの指示。(実行ファイルのサイズを小さく)
+# em++ では -Wl,-s を指定しない。
 ifeq ($(DEBUG),OFF)
-	LDFLAGS += -Wl,-s
+	ifeq (,$(findstring em++,$(COMPILER)))
+		LDFLAGS += -Wl,-s
+	endif
 endif
 
 # mingw64では-D_WIN64,-D_WIN32は環境に応じて自動で設定されるので指定すべきではない。
@@ -260,8 +301,10 @@ ifneq (,$(findstring YANEURAOU_ENGINE_NNUE,$(YANEURAOU_EDITION)))
 endif
 
 CPPFLAGS += -DNO_EXCEPTIONS
-LDFLAGS += -lpthread
-LDFLAGS += -v
+ifeq (,$(findstring em++,$(COMPILER)))
+	LDFLAGS += -lpthread
+	LDFLAGS += -v
+endif
 
 ifeq ($(DEBUG),OFF)
 	OBJDIR   = ../obj
@@ -270,6 +313,10 @@ else
 endif
 ifeq "$(strip $(OBJDIR))" ""
 	OBJDIR = ..
+endif
+# em++ のオブジェクトファイルはネイティブ向けのものと混ざらないように分けておく。
+ifneq (,$(findstring em++,$(COMPILER)))
+	OBJDIR := $(OBJDIR)/wasm
 endif
 
 #SOURCES  = $(wildcard *.cpp)
@@ -539,6 +586,11 @@ else ifeq ($(TARGET_CPU),M1)
 
 else ifeq ($(TARGET_CPU),OTHER)
 	CPPFLAGS += -DNO_SSE
+
+else ifeq ($(TARGET_CPU),WASM)
+	# wasm32 は 64bit 環境ではないので、SSE 向けの実装 (64bit 前提) は使えない。
+	# 汎用の実装を使い、WebAssembly SIMD (simd128) による自動ベクトル化に任せる。
+	CPPFLAGS += -DNO_SSE -msimd128
 
 endif
 

@@ -19,11 +19,15 @@ void print_file(const std::string& path)
 		sync_cout << line << sync_endl;
 }
 
+#if defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#endif
+
 // ----------------------------------------
-//  main()
+//  初期化
 // ----------------------------------------
 
-int main(int argc, char* argv[])
+static void initialize(int argc, char* argv[])
 {
 	// 起動時に説明書きを出力。
 	print_file("startup_info.txt");
@@ -42,6 +46,33 @@ int main(int argc, char* argv[])
 
 	//Search::clear();
 	Eval::init();
+}
+
+#if defined(__EMSCRIPTEN__)
+
+// ----------------------------------------
+//  WebAssembly 版のエントリーポイント
+// ----------------------------------------
+
+// wasm 版では main() を持たない (-sINVOKE_RUN=0 --no-entry)。
+// wasm_pre.js がモジュールの初期化後にこの関数を呼び出し、
+// 以降の USI コマンドは usi_command() で 1 行ずつ渡される。
+extern "C" EMSCRIPTEN_KEEPALIVE void usi_init()
+{
+	static char program_name[] = "KomoringHeights";
+	static char* argv[] = { program_name, nullptr };
+	initialize(1, argv);
+}
+
+#else
+
+// ----------------------------------------
+//  main()
+// ----------------------------------------
+
+int main(int argc, char* argv[])
+{
+	initialize(argc, argv);
 
 	// USIコマンドの応答部
 
@@ -53,3 +84,5 @@ int main(int argc, char* argv[])
 
 	return 0;
 }
+
+#endif

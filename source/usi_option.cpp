@@ -3,6 +3,8 @@
 #include "usi.h"
 #include "misc.h"
 
+#include <sstream>
+
 using std::string;
 
 // Option設定が格納されたglobal object。
@@ -28,8 +30,14 @@ namespace USI {
 	// optionのdefault値を設定する。
 	void init(OptionsMap& o)
 	{
+#if defined(__EMSCRIPTEN__)
+		// wasm版はブラウザで動かすので、確保できるメモリが限られる。
+		// 確保に失敗するとブラウザのタブごと落ちるので上限を小さくしておく。
+		constexpr int MaxHashMB = 256;
+#else
 		// Hash上限。32bitモードなら2GB、64bitモードなら33TB
 		constexpr int MaxHashMB = Is64Bit ? 33554432 : 2048;
+#endif
 
 		// 並列探索するときのスレッド数
 		// CPUの搭載コア数をデフォルトとすべきかも知れないが余計なお世話のような気もするのでしていない。
@@ -43,7 +51,12 @@ namespace USI {
 		// そもそもで言うとsetoptionに対してそんなに時間のかかることをするとGUI側がtimeoutになる懸念もある。
 		// Stockfishもこうすべきだと思う。
 
-#if defined(USER_ENGINE)
+#if defined(USER_ENGINE) && defined(__EMSCRIPTEN__)
+		// wasm版ではスレッドごとにWorkerが生成されるので上限を控えめにする。
+		// 上限はMakefileのPTHREAD_POOL_SIZEと合わせること。
+		o["Threads"] << Option(1, 1, 4, [](const Option& o) { /* Threads.set(o); */ });
+		o["MultiPV"] << Option(1, 1, 800);
+#elif defined(USER_ENGINE)
 		// TTEntry の SharedExclusiveLock が int8_t の最大値までしか共有ロックを取れないので、127 スレッドが上限。
 		o["Threads"] << Option(4, 1, 127, [](const Option& o) { /* Threads.set(o); */ });
 		o["MultiPV"] << Option(1, 1, 800);
@@ -130,7 +143,11 @@ namespace USI {
 #else
 
 		// TANUKI_MATE_ENGINEのとき
+#if defined(__EMSCRIPTEN__)
+		o["USI_Hash"] << Option(64, 1, MaxHashMB);
+#else
 		o["USI_Hash"] << Option(4096, 1, MaxHashMB);
+#endif
 
 #endif // !defined(TANUKI_MATE_ENGINE) && !defined(YANEURAOU_MATE_ENGINE) && !defined(USER_ENGINE)
 
@@ -290,6 +307,17 @@ namespace USI {
 		idx = insert_order++; // idxは生成順に0から連番で番号を振る
 	}
 
+	// spin型の値として解釈できて、かつ[min,max]の範囲内であるかを判定する。
+	// stoll()は数値でないと例外を投げ、例外を無効にしたwasm版ではabort()してしまうので使わない。
+	static bool is_valid_spin_value(const std::string& v, s64 min, s64 max)
+	{
+		std::istringstream ss(v);
+		s64 value;
+		if (!(ss >> value) || !(ss >> std::ws).eof())
+			return false;
+		return min <= value && value <= max;
+	}
+
 	// USIプロトコル経由で値を設定されたときにそれをcurrentValueに反映させる。
 	Option& Option::operator=(const string& v) {
 
@@ -299,7 +327,7 @@ namespace USI {
 		// "EvalDir"などでstringの場合は空の文字列を設定したいことがあるので"string"に対して空の文字チェックは行わない。
 		if (  ((type != "button" && type != "string") && v.empty())
 			|| (type == "check" && v != "true" && v != "false")
-			|| (type == "spin" && (stoll(v) < min || stoll(v) > max)))
+			|| (type == "spin" && !is_valid_spin_value(v, min, max)))
 			return *this;
 
 		// ボタン型は値を設定するものではなく、単なるトリガーボタン。

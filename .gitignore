@@ -274,3 +274,7 @@ comments.md
 
 compile_commands.json
 .cache/
+
+# WebAssembly
+source/komoring-heights.js
+source/komoring-heights.wasm

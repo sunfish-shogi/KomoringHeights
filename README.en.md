@@ -35,6 +35,22 @@ You can find the list of available options in `source/Makefile`.
 A compiler for C++17 is required to build. We confirmed to build
 by GCC 10+ and Clang 11+. Compilers older than them are not supported.
 
+### WebAssembly
+
+A WebAssembly build that conforms to the [ShogiHome WASM ABI](https://github.com/sunfish-shogi/shogihome/blob/main/specs/wasm-engine-abi.md) (`shogihome-wasm-engine/1`)
+can be built with Emscripten (`emscripten/emsdk:6.0.6`) on Docker.
+
+```sh
+./script/wasm_build.sh
+```
+
+The artifacts (`engine.json`, `komoring-heights.js`, `komoring-heights.wasm` and `LICENSE.txt`) are generated in `build/wasm/komoring-heights/`.
+Put this directory under `public/engines/` of ShogiHome to use it as a built-in engine.
+`name`, `author` and `options` in `engine.json` are generated from the response of the built engine to the `usi` command.
+
+The WebAssembly build uses pthreads for the search threads, so it requires cross-origin isolation (`SharedArrayBuffer`).
+Since it runs in a browser, `Threads` is limited to 4, and `USI_Hash` defaults to 64 MB with a maximum of 256 MB.
+
 ## References
 
 See [References](source/engine/user-engine/docs/refs.md).
